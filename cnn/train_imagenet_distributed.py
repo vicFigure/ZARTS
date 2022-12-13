@@ -1,0 +1,463 @@
+import os
+import sys
+import json
+import numpy as np
+import time
+import torch
+import utils
+import glob
+import random
+import logging
+import argparse
+import torch.nn as nn
+import genotypes
+import torch.utils
+import torchvision.datasets as dset
+import torchvision.transforms as transforms
+import torch.backends.cudnn as cudnn
+import torch.distributed as dist
+from torch.cuda import amp
+
+from torch.autograd import Variable
+from model import NetworkImageNet as Network
+
+
+parser = argparse.ArgumentParser("training imagenet")
+parser.add_argument('--mode', type=str, default='eval', help='location of the data corpus')
+parser.add_argument('--data', type=str, default='../../../imageNet2012/ILSVRC2012', help='location of the data corpus')
+parser.add_argument('--workers', type=int, default=16, help='number of workers to load dataset')
+parser.add_argument('--batch_size', type=int, default=256, help='batch size')
+parser.add_argument('--learning_rate', type=float, default=0.1, help='init learning rate')
+parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
+parser.add_argument('--weight_decay', type=float, default=3e-5, help='weight decay')
+parser.add_argument('--report_freq', type=float, default=100, help='report frequency')
+parser.add_argument('--epochs', type=int, default=250, help='num of training epochs')
+parser.add_argument('--init_channels', type=int, default=48, help='num of init channels')
+parser.add_argument('--layers', type=int, default=14, help='total number of layers')
+parser.add_argument('--auxiliary', action='store_true', default=False, help='use auxiliary tower')
+parser.add_argument('--auxiliary_weight', type=float, default=0.4, help='weight for auxiliary loss')
+parser.add_argument('--drop_path_prob', type=float, default=0, help='drop path probability')
+parser.add_argument('--save', type=str, default='/tmp/checkpoints/', help='experiment name')
+parser.add_argument('--seed', type=int, default=0, help='random seed')
+parser.add_argument('--arch', type=str, default=None, help='which architecture to use')
+parser.add_argument('--grad_clip', type=float, default=5., help='gradient clipping')
+parser.add_argument('--label_smooth', type=float, default=0.1, help='label smoothing')
+parser.add_argument('--lr_scheduler', type=str, default='linear', help='lr scheduler, linear or cosine')
+parser.add_argument('--tmp_data_dir', type=str, default='/tmp/cache/', help='temp data dir')
+parser.add_argument('--note', type=str, default='try', help='note for this run')
+
+# distributed training
+parser.add_argument('--float16', action='store_true', default=False, help='enable AMP')
+parser.add_argument('--dist_eval', action='store_true', default=False, help='enable eval ddp')
+parser.add_argument('--world_size', type=int, default=1, help='world size')
+parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
+
+parser.add_argument('--base_path', type=str, default='EXP', help='which architecture to use')
+parser.add_argument('--genotype_name', type=str, default=None, help='which architecture to use')
+parser.add_argument('--from_scratch', action='store_true', default=False, help='path to ckpt file for re-trained weight')
+parser.add_argument('--load_file', type=str, default=None, help='path to ckpt file for re-trained weight')
+
+
+args, unparsed = parser.parse_known_args()
+
+#args.save = '{}eval-{}-{}'.format(args.save, args.note, time.strftime("%Y%m%d-%H%M%S"))
+#utils.create_exp_dir(args.save, scripts_to_save=glob.glob('*.py'))
+
+log_format = '%(asctime)s %(message)s'
+logging.basicConfig(stream=sys.stdout, level=logging.INFO,
+    format=log_format, datefmt='%m/%d %I:%M:%S %p')
+#fh = logging.FileHandler(os.path.join(args.save, 'log.txt'))
+#fh.setFormatter(logging.Formatter(log_format))
+#logging.getLogger().addHandler(fh)
+
+utils.init_distributed_mode(args)
+args.device = torch.device('cuda')
+args.seed = args.seed + utils.get_rank()
+
+CLASSES = 1000
+
+class CrossEntropyLabelSmooth(nn.Module):
+
+    def __init__(self, num_classes, epsilon):
+        super(CrossEntropyLabelSmooth, self).__init__()
+        self.num_classes = num_classes
+        self.epsilon = epsilon
+        self.logsoftmax = nn.LogSoftmax(dim=1)
+
+    def forward(self, inputs, targets):
+        log_probs = self.logsoftmax(inputs)
+        targets = torch.zeros_like(log_probs).scatter_(1, targets.unsqueeze(1), 1)
+        targets = (1 - self.epsilon) * targets + self.epsilon / self.num_classes
+        loss = (-targets * log_probs).mean(0).sum()
+        return loss
+
+def get_genotype(genotype_path, name):
+    genotype_file = os.path.join(genotype_path, '%s.txt'%name)
+    tmp_dict = json.load(open(genotype_file,'r'))
+    genotype = genotypes.Genotype(**tmp_dict)
+    return genotype
+
+
+def main():
+    if not torch.cuda.is_available():
+        logging.info('No GPU device available')
+        sys.exit(1)
+    np.random.seed(args.seed)
+    cudnn.benchmark = True
+    torch.manual_seed(args.seed)
+    cudnn.enabled=True
+    torch.cuda.manual_seed(args.seed)
+    logging.info("args = %s", args)
+    logging.info("unparsed_args = %s", unparsed)
+    num_gpus = torch.cuda.device_count()   
+
+    if not os.path.exists(args.base_path):
+      os.makedirs(args.base_path)
+    ckpt_dir = os.path.join(args.base_path, "ImageNet")
+    if not os.path.exists(ckpt_dir):
+      os.makedirs(ckpt_dir)
+    if args.arch is not None:
+      genotype = eval("genotypes.%s" % args.arch)
+    elif args.base_path is not None and args.genotype_name is not None:
+      genotype_path = os.path.join(args.base_path, 'results_of_7q/genotype')
+      genotype = get_genotype(genotype_path, args.genotype_name)
+    else:
+      raise(ValueError("the parser input arch, genotype_path, genotype_name should not be all None"))
+#    print(genotype)
+
+#    genotype = eval("genotypes.%s" % args.arch)
+    print('---------Genotype---------')
+    logging.info(genotype)
+    print('--------------------------') 
+    model = Network(args.init_channels, CLASSES, args.layers, args.auxiliary, genotype)
+    if num_gpus > 1:
+        model = model.to(args.device)
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+    else:
+        model = model.cuda()
+    if utils.is_main_process():
+        logging.info("param size = %fMB", utils.count_parameters_in_MB(model))
+
+    criterion = nn.CrossEntropyLoss()
+    criterion = criterion.cuda()
+    criterion_smooth = CrossEntropyLabelSmooth(CLASSES, args.label_smooth)
+    criterion_smooth = criterion_smooth.cuda()
+
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        args.learning_rate,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay
+        )
+#    data_dir = os.path.join(args.tmp_data_dir, 'imagenet')
+    traindir = os.path.join(args.data, 'train')
+    validdir = os.path.join(args.data, 'val')
+#    traindir = os.path.join(args.data, 'ILSVRC2012_train')
+#    validdir = os.path.join(args.data, 'ILSVRC2012_img_val')
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    valid_data = dset.ImageFolder(
+        validdir,
+        transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            normalize,
+        ]))
+    train_data = dset.ImageFolder(
+        traindir,
+        transforms.Compose([
+            transforms.RandomResizedCrop(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(
+                brightness=0.4,
+                contrast=0.4,
+                saturation=0.4,
+                hue=0.2),
+            transforms.ToTensor(),
+            normalize,
+        ]))
+
+    if utils.is_dist_avail_and_initialized():  # args.distributed:
+        num_tasks = utils.get_world_size()
+        global_rank = utils.get_rank()
+        sampler_train = torch.utils.data.DistributedSampler(
+            train_data,
+            num_replicas=num_tasks,
+            # num_replicas=0,
+            rank=global_rank, shuffle=True
+        )
+        if args.dist_eval:
+            if len(valid_data) % num_tasks != 0:
+                print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
+                      'This will slightly alter validation results as extra duplicate entries are added to achieve '
+                      'equal num of samples per-process.')
+            sampler_val = torch.utils.data.DistributedSampler(
+                dataset_val,
+                num_replicas=num_tasks,
+                # num_replicas=0,
+                rank=global_rank, shuffle=False)
+        else:
+            sampler_val = torch.utils.data.SequentialSampler(valid_data)
+    else:
+        sampler_train = torch.utils.data.RandomSampler(train_data)
+        sampler_val = torch.utils.data.SequentialSampler(valid_data)
+
+    train_queue = torch.utils.data.DataLoader(
+        train_data, batch_size=args.batch_size, sampler=sampler_train, pin_memory=True, num_workers=args.workers, drop_last=True)
+
+    valid_queue = torch.utils.data.DataLoader(
+        valid_data, batch_size=args.batch_size, sampler=sampler_val, pin_memory=True, num_workers=args.workers, drop_last=False)
+
+    best_acc_top1 = 0
+    best_acc_top5 = 0
+
+    ckpt_file = None
+    start_epoch = 0
+    if not args.from_scratch:
+      # check wheter have pre-trained models
+      if args.load_file is not None and os.path.exists(args.load_file):
+          ckpt_file = args.load_file
+      else:
+          # deal with negative names
+          files = os.listdir(ckpt_dir)
+          for f in files:
+            tmp = f.split('.')
+            if len(tmp) > 2: continue
+            tmp = int(tmp[0].split('_')[1])
+            if tmp > start_epoch: 
+              start_epoch = tmp
+              ckpt_file = os.path.join(ckpt_dir, f)
+    if ckpt_file is not None:
+        logging.info('====== Load ckpt ======')
+        logging.info("Loading from %s"%ckpt_file)
+        checkpoint = torch.load(ckpt_file)
+        if num_gpus > 1:
+          model.module.load_state_dict(checkpoint['state_dict'])
+        else:
+          model.load_state_dict(checkpoint['state_dict'])
+        start_epoch = int(checkpoint['epoch']) + 1
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        best_acc_top1 = float(checkpoint['best_acc_top1'])
+        logging.info("Training Start at %d"%start_epoch)
+
+#    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.decay_period, gamma=args.gamma, last_epoch=start_epoch)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, float(args.epochs))
+
+    for epoch in range(start_epoch, args.epochs):
+        if utils.is_dist_avail_and_initialized():  # args.distributed:
+            train_queue.sampler.set_epoch(epoch)
+
+        scaler = amp.GradScaler(enabled=args.float16)
+
+        if args.lr_scheduler == 'cosine':
+            scheduler.step()
+            current_lr = scheduler.get_lr()[0]
+        elif args.lr_scheduler == 'linear':
+            current_lr = adjust_lr(optimizer, epoch)
+        else:
+            print('Wrong lr type, exit')
+            sys.exit(1)
+        if utils.is_main_process():
+            logging.info('Epoch: %d lr %e', epoch, current_lr)
+        if epoch < 5 and args.batch_size > 256:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = current_lr * (epoch + 1) / 5.0
+            if utils.is_main_process():
+                logging.info('Warming-up Epoch: %d, LR: %e', epoch, current_lr * (epoch + 1) / 5.0)
+        if num_gpus > 1:
+            model.module.drop_path_prob = args.drop_path_prob * epoch / args.epochs
+        else:
+            model.drop_path_prob = args.drop_path_prob * epoch / args.epochs
+        epoch_start = time.time()
+        train_acc, train_obj = train(train_queue, model, criterion_smooth, optimizer, scaler)
+        if utils.is_main_process():
+            logging.info('Train_acc: %f', train_acc)
+
+        valid_acc_top1, valid_acc_top5, valid_obj = infer(valid_queue, model, criterion)
+        if utils.is_main_process():
+            logging.info('Valid_acc_top1: %f', valid_acc_top1)
+            logging.info('Valid_acc_top5: %f', valid_acc_top5)
+            epoch_duration = time.time() - epoch_start
+            logging.info('Epoch time: %ds.', epoch_duration)
+            # save current epoch model, and remove previous model
+            try:
+                last_model = os.path.join(ckpt_dir, 'weights_%d.pt'%(epoch-1))
+                os.remove(last_model)
+            except:
+                pass
+            ckpt = {
+              'epoch': epoch,
+              'state_dict': model.state_dict(),
+              'best_acc_top1': best_acc_top1,
+              'optimizer' : optimizer.state_dict(),
+                   }
+            utils.save(model, os.path.join(ckpt_dir, 'weights_%d.pt'%(epoch)), ckpt=ckpt)
+
+            if valid_acc_top1 > best_acc_top1:
+              try:
+                  last_model = os.path.join(ckpt_dir, 'weights_%.3f.pt'%(best_acc_top1))
+                  os.remove(last_model)
+              except:
+                  pass
+              ckpt = {
+                'epoch': epoch,
+                'state_dict': model.state_dict(),
+                'best_acc_top1': best_acc_top1,
+                'optimizer' : optimizer.state_dict(),
+                     }
+              utils.save(model, os.path.join(ckpt_dir, 'weights_%.3f.pt'%(valid_acc_top1)), ckpt=ckpt)
+              best_acc_top1 = valid_acc_top1
+              best_acc_top5 = valid_acc_top5
+            print("the best acc: %f(Top1); %f(Top5)"%(best_acc_top1, best_acc_top5))
+        
+def adjust_lr(optimizer, epoch):
+    # Smaller slope for the last 5 epochs because lr * 1/250 is relatively large
+    if args.epochs -  epoch > 5:
+        lr = args.learning_rate * (args.epochs - 5 - epoch) / (args.epochs - 5)
+    else:
+        lr = args.learning_rate * (args.epochs - epoch) / ((args.epochs - 5) * 5)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    return lr        
+
+def train(train_queue, model, criterion, optimizer, scaler):
+    objs = utils.AverageMeter()
+    top1 = utils.AverageMeter()
+    top5 = utils.AverageMeter()
+    batch_time = utils.AverageMeter()
+    model.train()
+
+    for step, (input, target) in enumerate(train_queue):
+        target = target.cuda(non_blocking=True)
+        input = input.cuda(non_blocking=True)
+        b_start = time.time()
+        optimizer.zero_grad()
+        with amp.autocast(enabled=args.float16):
+            logits, logits_aux = model(input)
+            loss = criterion(logits, target)
+            if args.auxiliary:
+                loss_aux = criterion(logits_aux, target)
+                loss += args.auxiliary_weight*loss_aux
+
+        scaler.scale(loss).backward()
+#        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        scaler.step(optimizer)  # optimizer.step
+        scaler.update()
+#        optimizer.step()
+        batch_time.update(time.time() - b_start)
+        prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
+        n = input.size(0)
+        objs.update(loss.data.item(), n)
+        top1.update(prec1.data.item(), n)
+        top5.update(prec5.data.item(), n)
+
+        if utils.is_main_process():
+            if step % args.report_freq == 0:
+                end_time = time.time()
+                if step == 0:
+                    duration = 0
+                    start_time = time.time()
+                else:
+                    duration = end_time - start_time
+                    start_time = time.time()
+                logging.info('TRAIN Step: %03d Objs: %e R1: %f R5: %f Duration: %ds BTime: %.3fs', 
+                                        step, objs.avg, top1.avg, top5.avg, duration, batch_time.avg)
+
+    return top1.avg, objs.avg
+
+
+def infer(valid_queue, model, criterion):
+    objs = utils.AverageMeter()
+    top1 = utils.AverageMeter()
+    top5 = utils.AverageMeter()
+    model.eval()
+
+    for step, (input, target) in enumerate(valid_queue):
+        input = input.cuda()
+        target = target.cuda(non_blocking=True)
+        with torch.no_grad():
+            logits, _ = model(input)
+            loss = criterion(logits, target)
+
+        prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
+        n = input.size(0)
+        objs.update(loss.data.item(), n)
+        top1.update(prec1.data.item(), n)
+        top5.update(prec5.data.item(), n)
+
+        if utils.is_main_process():
+            if step % args.report_freq == 0:
+                end_time = time.time()
+                if step == 0:
+                    duration = 0
+                    start_time = time.time()
+                else:
+                    duration = end_time - start_time
+                    start_time = time.time()
+                logging.info('VALID Step: %03d Objs: %e R1: %f R5: %f Duration: %ds', step, objs.avg, top1.avg, top5.avg, duration)
+
+    return top1.avg, top5.avg, objs.avg
+
+
+def eval_arch(genotype_file, ckpt_path):
+  if not torch.cuda.is_available():
+    logging.info('no gpu device available')
+    sys.exit(1)
+
+  np.random.seed(args.seed)
+  cudnn.benchmark = True
+  torch.manual_seed(args.seed)
+  cudnn.enabled=True
+  torch.cuda.manual_seed(args.seed)
+  logging.info("args = %s", args)
+
+  tmp_dict = json.load(open(genotype_file,'r'))
+  genotype = genotypes.Genotype(**tmp_dict)
+  print(genotype)
+  model = Network(args.init_channels, CLASSES, args.layers, args.auxiliary, genotype)
+  model.drop_path_prob = 0.
+  num_gpus = torch.cuda.device_count()   
+  if num_gpus > 1:
+    model = nn.DataParallel(model).cuda()
+  else:
+    model = model.cuda()
+  logging.info("param size = %fMB", utils.count_parameters_in_MB(model))
+  model.load_state_dict(torch.load(ckpt_path), strict=False)
+
+  criterion = nn.CrossEntropyLoss()
+  criterion = criterion.cuda()
+  criterion_smooth = CrossEntropyLabelSmooth(CLASSES, args.label_smooth)
+  criterion_smooth = criterion_smooth.cuda()
+
+  validdir = os.path.join(args.data, 'Imagenet_val')
+  normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+  valid_data = dset.ImageFolder(
+    validdir,
+    transforms.Compose([
+      transforms.Resize(256),
+      transforms.CenterCrop(224),
+      transforms.ToTensor(),
+      normalize,
+    ]))
+  valid_queue = torch.utils.data.DataLoader(
+    valid_data, batch_size=args.batch_size, shuffle=False, pin_memory=True, num_workers=4)
+
+  valid_acc_top1, valid_acc_top5, valid_obj = infer(valid_queue, model, criterion)
+  logging.info('valid_acc_top1 %f', valid_acc_top1)
+  logging.info('valid_acc_top5 %f', valid_acc_top5)
+
+
+if __name__ == '__main__':
+    if args.mode == 'train':
+      main()
+    elif args.mode == 'eval':
+      base_dir = args.base_path
+      genotype_path = os.path.join(base_dir, 'results_of_7q/genotype')
+      genotype_names = [args.genotype_name]
+      genotype_file = os.path.join(genotype_path, '%s.txt'%(genotype_names[0]))
+      ckpt_path = args.load_file
+      eval_arch(genotype_file, ckpt_path)
+    else:
+      raise(ValueError("Not Implement mode for %s"%args.mode))
+
